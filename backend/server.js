@@ -1,10 +1,21 @@
 import express from 'express';
 import cors from 'cors';
 import mqtt from 'mqtt';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
 import { mqttConfig } from './config.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Create HTTP server and Socket.IO instance
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: "*", // Allow all origins in development
+    methods: ["GET", "POST"]
+  }
+});
 
 // MQTT client
 let mqttClient = null;
@@ -79,6 +90,9 @@ app.post('/api/mode', (req, res) => {
   // Send mode command to device via MQTT
   publishCommand('set_mode', { mode: mode });
   
+  // Emit mode change to all connected clients
+  io.emit('mode_update', { mode: systemState.mode });
+  
   res.json({ 
     success: true, 
     mode: systemState.mode,
@@ -115,6 +129,9 @@ app.post('/api/pump/start', (req, res) => {
     mode: systemState.mode 
   });
   
+  // Emit pump state update to all connected clients
+  emitSystemState();
+  
   res.json({ 
     success: true, 
     message: 'Pump started',
@@ -135,6 +152,9 @@ app.post('/api/pump/start', (req, res) => {
         
         // Send auto-stop command to device via MQTT
         publishCommand('pump_stop', { reason: 'auto_stop' });
+        
+        // Emit pump state update to all connected clients
+        emitSystemState();
       }
     }, durationMs);
   }
@@ -164,12 +184,32 @@ app.post('/api/pump/stop', (req, res) => {
   // Send pump stop command to device via MQTT
   publishCommand('pump_stop', { runTime: runTime });
   
+  // Emit pump state update to all connected clients
+  emitSystemState();
+  
   res.json({ 
     success: true, 
     message: 'Pump stopped',
     runTime: runTime
   });
 });
+
+// Emit system state to all connected WebSocket clients
+function emitSystemState() {
+  const status = {
+    pumpOn: systemState.pumpOn,
+    mode: systemState.mode,
+    pumpStartTime: systemState.pumpStartTime,
+    pumpDuration: systemState.pumpDuration,
+    remainingTime: systemState.pumpOn && systemState.pumpStartTime
+      ? Math.max(0, systemState.pumpDuration - (Date.now() - systemState.pumpStartTime))
+      : 0,
+    lastCommand: systemState.lastCommand,
+    lastCommandTime: systemState.lastCommandTime
+  };
+  
+  io.emit('status_update', status);
+}
 
 // Publish command to device via MQTT
 function publishCommand(command, data = {}) {
@@ -249,6 +289,9 @@ function connectMQTT() {
           };
           
           console.log('Sensor data updated:', sensorData);
+          
+          // Emit sensor data update to all connected clients
+          io.emit('sensor_update', sensorData);
         } catch (error) {
           console.error('Failed to parse MQTT message:', error.message);
           console.error('Raw message:', message.toString());
@@ -260,9 +303,33 @@ function connectMQTT() {
   }
 }
 
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+  console.log(`Client connected: ${socket.id}`);
+  
+  // Send current state to newly connected client
+  socket.emit('sensor_update', sensorData);
+  emitSystemState();
+  
+  // Handle client disconnection
+  socket.on('disconnect', () => {
+    console.log(`Client disconnected: ${socket.id}`);
+  });
+  
+  // Optional: Handle client requests for current data
+  socket.on('get_sensors', () => {
+    socket.emit('sensor_update', sensorData);
+  });
+  
+  socket.on('get_status', () => {
+    emitSystemState();
+  });
+});
+
 // Start server
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log(`Backend server running on http://localhost:${PORT}`);
+  console.log(`WebSocket server ready on ws://localhost:${PORT}`);
   console.log(`Ready to receive MQTT messages...`);
   
   // Connect to MQTT broker
