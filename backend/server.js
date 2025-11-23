@@ -6,7 +6,7 @@ import { mqttConfig } from './config.js';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Initialize MQTT client
+// MQTT client
 let mqttClient = null;
 
 // Middleware
@@ -23,6 +23,16 @@ let sensorData = {
   timestamp: Date.now()
 };
 
+// System state
+let systemState = {
+  pumpOn: false,
+  mode: 'automatic', // 'automatic' or 'manual'
+  pumpStartTime: null,
+  pumpDuration: 0, // in milliseconds
+  lastCommand: null,
+  lastCommandTime: null
+};
+
 // Basic health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Smart Watering Backend is running' });
@@ -31,6 +41,118 @@ app.get('/api/health', (req, res) => {
 // Get current sensor data
 app.get('/api/sensors', (req, res) => {
   res.json(sensorData);
+});
+
+// Get system status (pump state, mode, ...)
+app.get('/api/status', (req, res) => {
+  res.json({
+    pumpOn: systemState.pumpOn,
+    mode: systemState.mode,
+    pumpStartTime: systemState.pumpStartTime,
+    pumpDuration: systemState.pumpDuration,
+    remainingTime: systemState.pumpOn && systemState.pumpStartTime
+      ? Math.max(0, systemState.pumpDuration - (Date.now() - systemState.pumpStartTime))
+      : 0,
+    lastCommand: systemState.lastCommand,
+    lastCommandTime: systemState.lastCommandTime
+  });
+});
+
+// Get current mode
+app.get('/api/mode', (req, res) => {
+  res.json({ mode: systemState.mode });
+});
+
+// Set mode (automatic or manual)
+app.post('/api/mode', (req, res) => {
+  const { mode } = req.body;
+  
+  if (!mode || !['automatic', 'manual'].includes(mode)) {
+    return res.status(400).json({ 
+      error: 'Invalid mode. Must be "automatic" or "manual"' 
+    });
+  }
+  
+  systemState.mode = mode;
+  console.log(`Mode changed to: ${mode}`);
+  
+  res.json({ 
+    success: true, 
+    mode: systemState.mode,
+    message: `Mode set to ${mode}` 
+  });
+});
+
+// Start pump
+app.post('/api/pump/start', (req, res) => {
+  const { duration } = req.body; // duration in seconds 
+  
+  if (systemState.pumpOn) {
+    return res.status(400).json({ 
+      error: 'Pump is already running',
+      currentState: systemState 
+    });
+  }
+  
+  // Default duration
+  const durationMs = (duration || 10) * 1000; // 10 seconds default
+  
+  systemState.pumpOn = true;
+  systemState.pumpStartTime = Date.now();
+  systemState.pumpDuration = durationMs;
+  systemState.lastCommand = 'start';
+  systemState.lastCommandTime = Date.now();
+  
+  console.log(`Pump started. Duration: ${durationMs}ms`);
+  
+  res.json({ 
+    success: true, 
+    message: 'Pump started',
+    duration: durationMs,
+    mode: systemState.mode
+  });
+  
+  // Auto-stop after duration )
+  if (systemState.mode === 'automatic') {
+    setTimeout(() => {
+      if (systemState.pumpOn) {
+        systemState.pumpOn = false;
+        systemState.pumpStartTime = null;
+        systemState.pumpDuration = 0;
+        systemState.lastCommand = 'auto_stop';
+        systemState.lastCommandTime = Date.now();
+        console.log('Pump auto-stopped after duration');
+      }
+    }, durationMs);
+  }
+});
+
+// Stop pump
+app.post('/api/pump/stop', (req, res) => {
+  if (!systemState.pumpOn) {
+    return res.status(400).json({ 
+      error: 'Pump is not running',
+      currentState: systemState 
+    });
+  }
+  
+  const runTime = systemState.pumpStartTime 
+    ? Date.now() - systemState.pumpStartTime 
+    : 0;
+  
+  systemState.pumpOn = false;
+  systemState.pumpStartTime = null;
+  systemState.pumpDuration = 0;
+  systemState.lastCommand = 'stop';
+  systemState.lastCommandTime = Date.now();
+  
+  console.log(`Pump stopped. Was running for ${runTime}ms`);
+  
+  res.json({ 
+    success: true, 
+    message: 'Pump stopped',
+    runTime: runTime
+  });
 });
 
 // Connect to MQTT broker
