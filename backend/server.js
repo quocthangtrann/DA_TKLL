@@ -76,6 +76,9 @@ app.post('/api/mode', (req, res) => {
   systemState.mode = mode;
   console.log(`Mode changed to: ${mode}`);
   
+  // Send mode command to device via MQTT
+  publishCommand('set_mode', { mode: mode });
+  
   res.json({ 
     success: true, 
     mode: systemState.mode,
@@ -105,6 +108,13 @@ app.post('/api/pump/start', (req, res) => {
   
   console.log(`Pump started. Duration: ${durationMs}ms`);
   
+  // Send pump start command to device via MQTT
+  publishCommand('pump_start', { 
+    duration: duration, // duration in seconds
+    durationMs: durationMs,
+    mode: systemState.mode 
+  });
+  
   res.json({ 
     success: true, 
     message: 'Pump started',
@@ -122,6 +132,9 @@ app.post('/api/pump/start', (req, res) => {
         systemState.lastCommand = 'auto_stop';
         systemState.lastCommandTime = Date.now();
         console.log('Pump auto-stopped after duration');
+        
+        // Send auto-stop command to device via MQTT
+        publishCommand('pump_stop', { reason: 'auto_stop' });
       }
     }, durationMs);
   }
@@ -148,12 +161,42 @@ app.post('/api/pump/stop', (req, res) => {
   
   console.log(`Pump stopped. Was running for ${runTime}ms`);
   
+  // Send pump stop command to device via MQTT
+  publishCommand('pump_stop', { runTime: runTime });
+  
   res.json({ 
     success: true, 
     message: 'Pump stopped',
     runTime: runTime
   });
 });
+
+// Publish command to device via MQTT
+function publishCommand(command, data = {}) {
+  if (!mqttClient || !mqttClient.connected) {
+    console.error('MQTT client not connected. Cannot send command:', command);
+    return false;
+  }
+
+  const commandMessage = {
+    command: command,
+    timestamp: Date.now(),
+    ...data
+  };
+
+  const topic = mqttConfig.topics.command;
+  const message = JSON.stringify(commandMessage);
+
+  mqttClient.publish(topic, message, { qos: 1 }, (err) => {
+    if (err) {
+      console.error(`Failed to publish command "${command}":`, err.message);
+    } else {
+      console.log(`Command published to ${topic}:`, commandMessage);
+    }
+  });
+
+  return true;
+}
 
 // Connect to MQTT broker
 function connectMQTT() {
