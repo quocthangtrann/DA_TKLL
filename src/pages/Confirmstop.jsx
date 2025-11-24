@@ -1,7 +1,6 @@
-// src/pages/ConfirmStop.jsx
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { getPendingStop, registerHandlers, confirm, cancel, clearPendingStop } from "../services/confirmServices";
+import { getPendingStop, confirm, cancel, clearPendingStop } from "../services/confirmServices";
 
 function formatMs(ms) {
   if (!ms || ms <= 0) return "0s";
@@ -22,12 +21,6 @@ export default function ConfirmStopPage() {
       nav(-1);
       return;
     }
-
-    // register fallback handlers just in case
-    registerHandlers({
-      onConfirm: () => {},
-      onCancel: () => {},
-    });
 
     return () => {
       // cleanup if page unloads
@@ -57,9 +50,8 @@ export default function ConfirmStopPage() {
 
         <div className="flex justify-end gap-2">
           <button
-            onClick={() => {
-              // cancel → call service.cancel() then go back
-              cancel();
+            onClick={async () => {
+              await cancel();
               nav(-1);
             }}
             className="px-4 py-2 rounded border"
@@ -68,9 +60,8 @@ export default function ConfirmStopPage() {
           </button>
 
           <button
-            onClick={() => {
-              // confirm → call service.confirm() and go back
-              confirm();
+            onClick={async () => {
+              await confirm();
               nav(-1);
             }}
             className="px-4 py-2 rounded bg-red-600 text-white"

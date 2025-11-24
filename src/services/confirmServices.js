@@ -1,5 +1,3 @@
-// src/services/confirmService.js
-// tiny in-memory service to pass pending stop request between pages
 let pending = null;
 let onConfirmCallback = null;
 let onCancelCallback = null;
@@ -23,16 +21,22 @@ export function registerHandlers({ onConfirm, onCancel }) {
   onCancelCallback = onCancel;
 }
 
-export function confirm() {
-  if (typeof onConfirmCallback === "function") {
-    onConfirmCallback(pending);
+export async function confirm() {
+  try {
+    if (typeof onConfirmCallback === "function") {
+      await onConfirmCallback(pending);
+    }
+  } finally {
+    clearPendingStop();
   }
-  clearPendingStop();
 }
 
-export function cancel() {
-  if (typeof onCancelCallback === "function") {
-    onCancelCallback(pending);
+export async function cancel() {
+  try {
+    if (typeof onCancelCallback === "function") {
+      await onCancelCallback(pending);
+    }
+  } finally {
+    clearPendingStop();
   }
-  clearPendingStop();
 }
