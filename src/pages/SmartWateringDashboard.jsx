@@ -2,14 +2,8 @@ import React, { useEffect, useState, useRef } from "react";
 import SensorPanel from "../components/SensorPanel.jsx";
 import PumpControl from "../components/PumpControl.jsx";
 import LastWatered from "../components/LastWatered.jsx";
-import {
-  setPendingStop,
-  registerHandlers,
-  confirm as serviceConfirm,
-  cancel as serviceCancel,
-  clearPendingStop,
-} from "../services/confirmServices";
-import { useNavigate } from "react-router-dom";
+import websocketService from "../services/websocketService";
+import apiService from "../services/apiService";
 
 const LS_KEY = "smart-watering-lastWatered";
 const LS_HISTORY = "smart-watering-history";
@@ -24,7 +18,6 @@ function formatMs(ms) {
 }
 
 export default function SmartWateringDashboard() {
-  const navigate = useNavigate();
 
   const [mode, setMode] = useState("automatic");
   const [pumpOn, setPumpOn] = useState(false);
@@ -46,67 +39,150 @@ export default function SmartWateringDashboard() {
   const [remainingMs, setRemainingMs] = useState(0);
   const remainingRef = useRef(0);
   const pumpStartRef = useRef(null);
+  const pumpDurationRef = useRef(0);
   const intervalRef = useRef(null);
 
   // Manual duration
   const [manualDurationSec, setManualDurationSec] = useState(10);
+  
+  // Connection status
+  const [isConnected, setIsConnected] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [stopConfirmData, setStopConfirmData] = useState(null);
+  const [isStopSubmitting, setIsStopSubmitting] = useState(false);
 
-  // === Simulation loop ===
   useEffect(() => {
-    const id = setInterval(() => {
-      setSensors((s) => ({
-        temp: Math.round(20 + Math.sin(Date.now() / 7000) * 4),
-        hum: Math.min(100, Math.max(10, Math.round(s.hum + (Math.random() * 4 - 2)))),
-        soil: Math.min(100, Math.max(0, Math.round(s.soil + (Math.random() * 2 - 1)))),
-        level: Math.min(100, Math.max(0, Math.round(s.level + (Math.random() * 1.5 - 0.75)))),
-        flow: pumpOn ? Math.round(60 + Math.random() * 10) : 0,
-      }));
-    }, 1500);
-    return () => clearInterval(id);
-  }, [pumpOn]);
+    // Connect to WebSocket
+    websocketService.connect();
 
-  // === Automatic rule demo ===
+    // Handle sensor updates from WebSocket
+    const handleSensorUpdate = (data) => {
+      setSensors({
+        temp: data.temp || 0,
+        hum: data.hum || 0,
+        soil: data.soil || 0,
+        level: data.level || 0,
+        flow: data.flow || 0,
+      });
+    };
+
+    // Handle status updates from WebSocket
+    const handleStatusUpdate = (data) => {
+      setPumpOn(data.pumpOn || false);
+      setMode(data.mode || "automatic");
+      setRemainingMs(data.remainingTime || 0);
+      
+      if (data.pumpStartTime) {
+        pumpStartRef.current = data.pumpStartTime;
+        pumpDurationRef.current = data.pumpDuration || 0;
+      } else {
+        pumpStartRef.current = null;
+        pumpDurationRef.current = 0;
+      }
+    };
+
+    // Handle mode updates
+    const handleModeUpdate = (data) => {
+      setMode(data.mode || "automatic");
+    };
+
+    // Handle connection status
+    const handleConnect = () => {
+      setIsConnected(true);
+      setIsLoading(false);
+      // Request current data
+      websocketService.requestSensors();
+      websocketService.requestStatus();
+    };
+
+    const handleDisconnect = () => {
+      setIsConnected(false);
+    };
+
+    // Register event listeners
+    websocketService.on('sensor_update', handleSensorUpdate);
+    websocketService.on('status_update', handleStatusUpdate);
+    websocketService.on('mode_update', handleModeUpdate);
+    websocketService.on('connect', handleConnect);
+    websocketService.on('disconnect', handleDisconnect);
+
+    // If socket is already connected (e.g., returning from confirm page),
+    // manually trigger connect handler so UI state stays in sync.
+    if (websocketService.isConnected()) {
+      handleConnect();
+    }
+
+    // Initial data fetch via API
+    const fetchInitialData = async () => {
+      try {
+        const [sensorData, statusData] = await Promise.all([
+          apiService.getSensors(),
+          apiService.getStatus(),
+        ]);
+        
+        setSensors({
+          temp: sensorData.temp || 0,
+          hum: sensorData.hum || 0,
+          soil: sensorData.soil || 0,
+          level: sensorData.level || 0,
+          flow: sensorData.flow || 0,
+        });
+        
+        setPumpOn(statusData.pumpOn || false);
+        setMode(statusData.mode || "automatic");
+        setRemainingMs(statusData.remainingTime || 0);
+        
+        if (statusData.pumpStartTime) {
+          pumpStartRef.current = statusData.pumpStartTime;
+        }
+        
+        setIsLoading(false);
+      } catch (error) {
+        console.error('Failed to fetch initial data:', error);
+        setIsLoading(false);
+      }
+    };
+
+    fetchInitialData();
+
+    // Cleanup
+    return () => {
+      websocketService.off('sensor_update', handleSensorUpdate);
+      websocketService.off('status_update', handleStatusUpdate);
+      websocketService.off('mode_update', handleModeUpdate);
+      websocketService.off('connect', handleConnect);
+      websocketService.off('disconnect', handleDisconnect);
+    };
+  }, []);
+
+  // Automatic rules
   useEffect(() => {
     if (mode !== "automatic") return;
     if (sensors.soil < 40 && sensors.level > 20 && !pumpOn) {
-      startPump("automatic", 8000);
+      handleAutoStart();
     }
-  }, [mode, sensors.soil, sensors.level]);
+  }, [mode, sensors.soil, sensors.level, pumpOn]);
 
   // Keep ref in sync
   useEffect(() => {
     remainingRef.current = remainingMs;
   }, [remainingMs]);
 
-  // Countdown loop
+  // Update remaining time from WebSocket status updates
   useEffect(() => {
-    if (pumpOn && remainingRef.current > 0 && !intervalRef.current) {
-      intervalRef.current = setInterval(() => {
-        setRemainingMs((r) => {
-          const next = r - 250;
-          if (next <= 0) {
-            completePump("automatic");
-            return 0;
-          }
-          return next;
-        });
+    if (pumpOn && remainingMs > 0) {
+      const interval = setInterval(() => {
+        if (pumpStartRef.current) {
+          const elapsed = Date.now() - pumpStartRef.current;
+          const remaining = Math.max(0, pumpDurationRef.current - elapsed);
+          setRemainingMs(remaining);
+        }
       }, 250);
+      return () => clearInterval(interval);
     }
+  }, [pumpOn, remainingMs]);
 
-    if (!pumpOn && intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-
-    return () => {
-      if (intervalRef.current && !pumpOn) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-    };
-  }, [pumpOn]);
-
-  // === History utilities ===
+  // History Implementation
   function addHistoryEntry(entry) {
     try {
       const raw = localStorage.getItem(LS_HISTORY);
@@ -125,102 +201,99 @@ export default function SmartWateringDashboard() {
     window.dispatchEvent(new Event("lastWateredUpdated"));
   }
 
-  // === Pump operations ===
-  function startPump(modeLabel = "manual", durationMs = 10000) {
+  // Start pump
+  async function startPump(modeLabel = "manual", durationSec = 10) {
     if (pumpOn) return;
-    setPumpOn(true);
-
-    pumpStartRef.current = Date.now();
-    setRemainingMs(durationMs);
-  }
-
-  function completePump(modeLabel = "manual") {
-    if (!pumpOn) return;
-
-    const start = pumpStartRef.current || Date.now();
-    const durationMs = Date.now() - start;
-
-    const flow = sensors.flow || 0;
-    const liters = (flow * durationMs) / 60000.0;
-
-    addHistoryEntry({
-      timestamp: Date.now(),
-      mode: modeLabel,
-      durationMs,
-      estimatedLiters: liters,
-      sensors: { ...sensors },
-      stoppedEarly: false,
-    });
-
-    setPumpOn(false);
-    setRemainingMs(0);
-    pumpStartRef.current = null;
-
-    markLastWatered(Date.now());
-  }
-
-  function stopPumpEarly(modeLabel = "manual") {
-    if (!pumpOn) return;
-
-    const start = pumpStartRef.current || Date.now();
-    const durationMs = Date.now() - start;
-
-    const flow = sensors.flow || 0;
-    const liters = (flow * durationMs) / 60000.0;
-
-    addHistoryEntry({
-      timestamp: Date.now(),
-      mode: modeLabel,
-      durationMs,
-      estimatedLiters: liters,
-      sensors: { ...sensors },
-      stoppedEarly: true,
-    });
-
-    setPumpOn(false);
-    setRemainingMs(0);
-    pumpStartRef.current = null;
-
-    markLastWatered(Date.now());
-  }
-
-  // === Confirm-stop handlers ===
-  useEffect(() => {
-    registerHandlers({
-      onConfirm: () => {
-        stopPumpEarly("manual");
-      },
-      onCancel: () => {},
-    });
-
-    return () => {
-      clearPendingStop();
-    };
-  }, []);
-
-  function requestStopPump(modeLabel) {
-    if (!pumpOn) return;
-
-    if (remainingRef.current > 0) {
-      setPendingStop({
-        mode: modeLabel,
-        remainingMs: remainingRef.current,
-        sensors: { ...sensors },
-      });
-
-      navigate("/confirm-stop");
-    } else {
-      stopPumpEarly(modeLabel);
+    
+    try {
+      await apiService.startPump(durationSec);
+      // State will be updated via WebSocket
+    } catch (error) {
+      console.error('Failed to start pump:', error);
+      alert('Failed to start pump: ' + error.message);
     }
   }
 
-  // Manual start
-  function handleManualStart() {
-    const dur = manualDurationSec * 1000;
-    startPump("manual", dur);
+  // Auto start pump
+  async function handleAutoStart() {
+    try {
+      await apiService.startPump(8); // 8 seconds for automatic mode
+    } catch (error) {
+      console.error('Failed to auto-start pump:', error);
+    }
   }
 
-  // === UI State ===
+  // Stop pump early
+  async function stopPumpEarly(modeLabel = "manual", { force = false } = {}) {
+    if (!pumpOn && !force) return;
+
+    try {
+      setIsStopSubmitting(true);
+      const result = await apiService.stopPump();
+      
+      // Add to history
+      const start = pumpStartRef.current || Date.now();
+      const durationMs = result.runTime || (Date.now() - start);
+      const flow = sensors.flow || 0;
+      const liters = (flow * durationMs) / 60000.0;
+
+      addHistoryEntry({
+        timestamp: Date.now(),
+        mode: modeLabel,
+        durationMs,
+        estimatedLiters: liters,
+        sensors: { ...sensors },
+        stoppedEarly: true,
+      });
+
+      markLastWatered(Date.now());
+      // State will be updated via WebSocket
+    } catch (error) {
+      console.error('Failed to stop pump:', error);
+      alert('Failed to stop pump: ' + error.message);
+    } finally {
+      setIsStopSubmitting(false);
+    }
+  }
+
+  function requestStopPump(modeLabel) {
+    if (!pumpOn) return;
+    setStopConfirmData({
+      mode: modeLabel,
+      remainingMs: remainingRef.current,
+      sensors: { ...sensors },
+    });
+  }
+
+  function handleCancelStop() {
+    if (isStopSubmitting) return;
+    setStopConfirmData(null);
+  }
+
+  async function handleConfirmStop() {
+    if (!stopConfirmData) return;
+    await stopPumpEarly(stopConfirmData.mode || "manual", { force: true });
+    setStopConfirmData(null);
+  }
+
+  // Manual start
+  async function handleManualStart() {
+    await startPump("manual", manualDurationSec);
+  }
+
+  // Handle mode toggle
+  async function handleModeToggle() {
+    const newMode = mode === "automatic" ? "manual" : "automatic";
+    try {
+      await apiService.setMode(newMode);
+      // State will be updated via WebSocket
+    } catch (error) {
+      console.error('Failed to change mode:', error);
+      alert('Failed to change mode: ' + error.message);
+    }
+  }
+
+  // UI State
   const statusText = pumpOn
     ? `Watering — remaining ${formatMs(remainingMs)}`
     : "Not watering";
@@ -237,23 +310,30 @@ export default function SmartWateringDashboard() {
           <div className="flex items-center gap-4">
             <p className="text-sm text-gray-600">Mode</p>
             <button
-              onClick={() => setMode((m) => (m === "automatic" ? "manual" : "automatic"))}
+              onClick={handleModeToggle}
+              disabled={isLoading}
               className={`px-4 py-2 rounded-full font-medium border ${
                 mode === "automatic" ? "bg-white shadow" : "bg-white/60"
-              }`}
+              } ${isLoading ? "opacity-50 cursor-not-allowed" : ""}`}
             >
               {mode === "automatic" ? "Automatic" : "Manual"}
             </button>
+            <div className="flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${isConnected ? "bg-green-500" : "bg-red-500"}`}></span>
+              <span className="text-xs text-gray-500">
+                {isConnected ? "Connected" : "Disconnected"}
+              </span>
+            </div>
           </div>
         </header>
 
         <main className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {/* SENSOR PANEL */}
+          {/* Sensor Panel */}
           <SensorPanel sensors={sensors} />
 
-          {/* RIGHT SIDEBAR */}
+          {/* Right Sidebar */}
           <aside className="bg-white p-5 rounded-xl shadow-sm flex flex-col gap-4">
-            {/* Watering status */}
+            {/* Watering Status */}
             <div>
               <h4 className="text-xs text-gray-500">Watering status</h4>
               <div
@@ -270,7 +350,7 @@ export default function SmartWateringDashboard() {
               </div>
             </div>
 
-            {/* Manual duration */}
+            {/* Manual Duration */}
             <div>
               <h4 className="text-xs text-gray-500">Manual watering duration</h4>
               <select
@@ -284,7 +364,7 @@ export default function SmartWateringDashboard() {
               </select>
             </div>
 
-            {/* Pump Control */}
+            {/* Pump Control Button */}
             <div>
               <h4 className="text-xs text-gray-500">Pump Control</h4>
 
@@ -292,16 +372,22 @@ export default function SmartWateringDashboard() {
                 <button
                   onClick={() => {
                     if (mode === "manual") handleManualStart();
-                    else startPump("automatic", 8000);
+                    else startPump("automatic", 8);
                   }}
-                  className="w-full mt-3 px-4 py-3 rounded-2xl font-bold text-lg bg-green-600 text-white hover:bg-green-700"
+                  disabled={isLoading || !isConnected}
+                  className={`w-full mt-3 px-4 py-3 rounded-2xl font-bold text-lg bg-green-600 text-white hover:bg-green-700 ${
+                    isLoading || !isConnected ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
                 >
                   Start Pump
                 </button>
               ) : (
                 <button
                   onClick={() => requestStopPump(mode)}
-                  className="w-full mt-3 px-4 py-3 rounded-2xl font-bold text-lg bg-red-500 text-white hover:bg-red-600"
+                  disabled={isLoading || !isConnected}
+                  className={`w-full mt-3 px-4 py-3 rounded-2xl font-bold text-lg bg-red-500 text-white hover:bg-red-600 ${
+                    isLoading || !isConnected ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
                 >
                   Stop Pump
                 </button>
@@ -312,7 +398,7 @@ export default function SmartWateringDashboard() {
               </p>
             </div>
 
-            {/* Last Watered */}
+            {/* Last Watered Timestamp */}
             <LastWatered
               lastWateredTimestamp={lastWatered}
               onClear={() => {
@@ -321,28 +407,10 @@ export default function SmartWateringDashboard() {
               }}
             />
 
-            {/* Quick Actions */}
-            <div className="mt-auto pt-2">
-              <h4 className="text-xs text-gray-500">Quick actions</h4>
-              <div className="flex gap-2 mt-2">
-                <button
-                  onClick={() => setSensors((s) => ({ ...s, level: 100 }))}
-                  className="flex-1 px-3 py-2 border rounded text-sm"
-                >
-                  Fill tank
-                </button>
-                <button
-                  onClick={() => setSensors({ temp: 24, hum: 66, soil: 60, level: 56, flow: 0 })}
-                  className="flex-1 px-3 py-2 border rounded text-sm"
-                >
-                  Reset
-                </button>
-              </div>
-            </div>
 
             <div className="pt-4 text-xs text-gray-400">
               <p>
-                Connected: <span className="text-green-600 font-semibold">●</span>
+                Backend: <span className={isConnected ? "text-green-600" : "text-red-600"}>{isConnected ? "● Connected" : "● Disconnected"}</span>
               </p>
               <p className="mt-1">Firmware: v1.2.3</p>
             </div>
@@ -353,6 +421,47 @@ export default function SmartWateringDashboard() {
           · Designed for ESP32 · 
         </footer>
       </div>
+
+      {stopConfirmData && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 backdrop-blur-sm px-4">
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl p-6">
+            <h2 className="text-xl font-semibold text-gray-900 mb-2">Stop watering early?</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              Pump still has <strong>{formatMs(stopConfirmData.remainingMs)}</strong> remaining.
+              Stopping now will end the cycle early and log a shortened run.
+            </p>
+
+            <div className="mb-4 bg-gray-50 p-3 rounded-lg text-sm">
+              <div><strong>Mode:</strong> {stopConfirmData.mode}</div>
+              <div><strong>Remaining:</strong> {formatMs(stopConfirmData.remainingMs)}</div>
+              <div className="text-xs text-gray-600 mt-2">
+                Temp: {stopConfirmData.sensors?.temp}°C · Hum: {stopConfirmData.sensors?.hum}% · Soil: {stopConfirmData.sensors?.soil}% · Level: {stopConfirmData.sensors?.level}%
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={handleCancelStop}
+                disabled={isStopSubmitting}
+                className={`px-4 py-2 rounded border text-sm font-medium ${
+                  isStopSubmitting ? "opacity-50 cursor-not-allowed" : ""
+                }`}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmStop}
+                disabled={isStopSubmitting}
+                className={`px-4 py-2 rounded bg-red-600 text-white text-sm font-semibold shadow ${
+                  isStopSubmitting ? "opacity-50 cursor-not-allowed" : "hover:bg-red-700"
+                }`}
+              >
+                {isStopSubmitting ? "Stopping..." : "Stop anyway"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
